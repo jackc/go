@@ -4211,6 +4211,121 @@ func TestNamedValueCheckerSkip(t *testing.T) {
 	}
 }
 
+type rcsDriver struct {
+	fakeDriver
+}
+
+func (d *rcsDriver) Open(dsn string) (driver.Conn, error) {
+	c, err := d.fakeDriver.Open(dsn)
+	fc := c.(*fakeConn)
+	fc.db.allowAny = true
+	return &rcsConn{fc}, err
+}
+
+type rcsConn struct {
+	*fakeConn
+}
+
+func (c *rcsConn) CheckNamedValue(nv *driver.NamedValue) error {
+	switch nv.Value.(type) {
+	case rcsSlice:
+		// it is ok to store a value of type rcsSlice
+		return nil
+	}
+	return driver.ErrSkip
+}
+
+func (c *rcsConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	s, err := c.fakeConn.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return &rcsStmt{s.(*fakeStmt)}, nil
+}
+
+type rcsStmt struct {
+	*fakeStmt
+}
+
+func (s *rcsStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	rs, err := s.fakeStmt.QueryContext(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	return &rcsRows{rs.(*rowsCursor)}, nil
+}
+
+type rcsRows struct {
+	*rowsCursor
+}
+
+func (r *rcsRows) ScanColumn(dest any, index int) error {
+	switch d := dest.(type) {
+	case *rcsSlice:
+		row := r.rows[r.posSet][r.posRow]
+		if row != nil && len(row.cols) > index {
+			if s, ok := row.cols[index].(rcsSlice); ok {
+				*d = s
+				return nil
+			}
+		}
+	}
+	return driver.ErrSkip
+}
+
+var _ driver.NamedValueChecker = &rcsConn{}
+var _ driver.RowsColumnScanner = &rcsRows{}
+
+type rcsSlice []int
+
+func TestRowsColumnScanner(t *testing.T) {
+	Register("RowsColumnScanner", &rcsDriver{})
+	db, err := Open("RowsColumnScanner", "rcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var data = []struct {
+		name string
+		s    rcsSlice
+	}{
+		{"Alice", rcsSlice{1, 2, 3}},
+		{"Bob", rcsSlice{4, 5, 6}},
+		{"Chris", rcsSlice{7, 8, 9}},
+	}
+	exec(t, db, "CREATE|rcs|name=string,slice=any")
+	for i := range len(data) {
+		exec(t, db, "INSERT|rcs|name=?,slice=?", data[i].name, data[i].s)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, "SELECT|rcs|name,slice|")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	for i := 0; rows.Next(); i++ {
+		var (
+			name string
+			s    rcsSlice
+		)
+		if err := rows.Scan(&name, &s); err != nil {
+			t.Fatal(err)
+		}
+		if name != data[i].name {
+			t.Fatalf("name = %q, want %q", name, data[i].name)
+		}
+		if !slices.Equal(s, data[i].s) {
+			t.Fatalf("s = %#v, want %#v", s, data[i].s)
+		}
+	}
+
+}
+
 func TestOpenConnector(t *testing.T) {
 	Register("testctx", &fakeDriverCtx{})
 	db, err := Open("testctx", "people")
